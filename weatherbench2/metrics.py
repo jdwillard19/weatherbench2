@@ -24,6 +24,7 @@ import typing as t
 import numpy as np
 from scipy import stats
 from weatherbench2 import thresholds
+from weatherbench2 import utils
 from weatherbench2.regions import Region
 import xarray as xr
 
@@ -114,6 +115,7 @@ class Metric:
       forecast: xr.Dataset,
       truth: xr.Dataset,
       region: t.Optional[Region] = None,
+      skipna: bool = False,
   ) -> xr.Dataset:
     """Evaluate this metric on datasets with full temporal coverages."""
     if "time" in forecast.dims:
@@ -124,7 +126,10 @@ class Metric:
       raise ValueError(
           f"Forecast has neither valid_time or init_time dimension {forecast}"
       )
-    return self.compute_chunk(forecast, truth, region=region).mean(avg_dim)
+    return self.compute_chunk(forecast, truth, region=region).mean(
+        avg_dim,
+        skipna=skipna,
+    )
 
 
 def _spatial_average(
@@ -485,6 +490,39 @@ class SEEPS(SpatialSEEPS):
 ################################################################################
 
 
+def _debiased_ensemble_mean_mse(
+    forecast: xr.Dataset,
+    truth: xr.Dataset,
+    ensemble_dim: str,
+) -> xr.Dataset:
+  """Debiased estimate of E(forecast.mean() - truth)².
+
+  Suppose we have n iid {Xₖ}, each with mean μ and variance σ², and ground
+  truth Y. We wish to estimate M = (Y - μ)² in an unbiased fashion.
+  Define
+    μ(n)  = (1/n) Sum(Xₖ)
+    σ²(n) = (1/(n-1)) Sum((Xₖ - μ(n))²)
+    M(n)  = (μ(n) - Y)²
+    M̃(n)  = M(n) - (1/n) σ²(n)
+  One can check that
+    E[M̃(n)] = E[M(n)] - σ²/n
+            = E[M] + σ²/n - σ²/n
+            = E[M].
+
+  Args:
+    forecast: A forecast dataset.
+    truth: A ground truth dataset.
+    ensemble_dim: Dimension indexing ensembles in the forecast.
+
+  Returns:
+    Dataset with debiased (forecast - truth)².
+  """
+  forecast_mean = forecast.mean(ensemble_dim, skipna=False)
+  forecast_var = forecast.var(ensemble_dim, skipna=False, ddof=1)
+  biased_mse = (truth - forecast_mean) ** 2
+  return biased_mse - forecast_var / _get_n_ensemble(forecast, ensemble_dim)
+
+
 def _get_n_ensemble(
     ds: xr.Dataset,
     ensemble_dim: str,
@@ -520,9 +558,10 @@ class EnsembleMetric(Metric):
       forecast: xr.Dataset,
       truth: xr.Dataset,
       region: t.Optional[Region] = None,
+      skipna: bool = False,
   ) -> xr.Dataset:
     """Evaluate this metric on datasets with full temporal coverages."""
-    result = super().compute(forecast, truth, region=region)
+    result = super().compute(forecast, truth, region=region, skipna=skipna)
     return result.assign_attrs(ensemble_size=forecast[self.ensemble_dim].size)
 
 
@@ -599,7 +638,7 @@ class CRPSSpread(EnsembleMetric):
   ) -> xr.Dataset:
     """CRPSSpread, averaged over space, for a time chunk of data."""
     return _spatial_average(
-        _pointwise_crps_spread(forecast, truth, self.ensemble_dim),
+        _pointwise_crps_spread(forecast, self.ensemble_dim),
         region=region,
     )
 
@@ -650,7 +689,7 @@ class SpatialCRPSSpread(EnsembleMetric):
       region: t.Optional[Region] = None,
   ) -> xr.Dataset:
     """CRPSSpread, averaged over space, for a time chunk of data."""
-    return _pointwise_crps_spread(forecast, truth, self.ensemble_dim)
+    return _pointwise_crps_spread(forecast, self.ensemble_dim)
 
 
 @dataclasses.dataclass
@@ -667,11 +706,16 @@ class SpatialCRPSSkill(EnsembleMetric):
     return _pointwise_crps_skill(forecast, truth, self.ensemble_dim)
 
 
+@utils.dataset_safe_lru_cache(
+    # This is used in _metric_and_region_loop. The same dataset is used
+    # repeatedly for different metrics/regions, then the loop returns.
+    # Therefore, maxsize=1 is sufficient.
+    maxsize=1,
+)
 def _pointwise_crps_spread(
-    forecast: xr.Dataset, truth: xr.Dataset, ensemble_dim: str
+    forecast: xr.Dataset, ensemble_dim: str
 ) -> xr.Dataset:
   """CRPS spread at each point in truth, averaged over ensemble only."""
-  del truth  # unused
   n_ensemble = _get_n_ensemble(forecast, ensemble_dim)
   if n_ensemble < 2:
     return xr.zeros_like(forecast.isel({ensemble_dim: 0}))
@@ -713,9 +757,22 @@ def _rank_ds(ds: xr.Dataset, dim: str) -> xr.Dataset:
   """The ranking of `ds` along `dim`, with 1 being the smallest entry."""
 
   def _rank_da(da: xr.DataArray) -> np.ndarray:
-    return stats.rankdata(da.values, method="ordinal", axis=da.dims.index(dim))
+    return _rankdata(da.values, axis=da.dims.index(dim))
 
   return ds.copy(data={k: _rank_da(v) for k, v in ds.items()})
+
+
+def _rankdata(x: np.ndarray, axis: int) -> np.ndarray:
+  """Version of (ordinal) scipy.rankdata from V13."""
+  x = np.asarray(x)
+  x = np.swapaxes(x, axis, -1)
+  j = np.argsort(x, axis=-1)
+  ordinal_ranks = np.broadcast_to(
+      np.arange(1, x.shape[-1] + 1, dtype=int), x.shape
+  )
+  ordered_ranks = np.empty(j.shape, dtype=ordinal_ranks.dtype)
+  np.put_along_axis(ordered_ranks, j, ordinal_ranks, axis=-1)
+  return np.swapaxes(ordered_ranks, axis, -1)
 
 
 @dataclasses.dataclass
@@ -828,7 +885,7 @@ class GaussianBrierScore(Metric):
     Spatially averaged Brier score for a Gaussian distribution.
   """
 
-  threshold: thresholds.Threshold | Sequence[thresholds.Threshold]
+  threshold: t.Union[thresholds.Threshold, Sequence[thresholds.Threshold]]
 
   def compute_chunk(
       self,
@@ -899,7 +956,7 @@ class GaussianIgnoranceScore(Metric):
     Spatially averaged ignorance score for a Gaussian distribution.
   """
 
-  threshold: thresholds.Threshold | Sequence[thresholds.Threshold]
+  threshold: t.Union[thresholds.Threshold, Sequence[thresholds.Threshold]]
 
   def compute_chunk(
       self,
@@ -1148,7 +1205,12 @@ class EnsembleMeanRMSESqrtBeforeTimeAvg(EnsembleMetric):
 
 @dataclasses.dataclass
 class EnsembleMeanMSE(EnsembleMetric):
-  """Mean square error between the ensemble mean and ground truth."""
+  """Mean square error between the ensemble mean and ground truth.
+
+  Suppose we have a size n ensemble, {Xₖ}, each an iid copy of X having with
+  mean μ and variance σ². Let Y be the ground truth.
+  This class estimates E(X - Y)² with a bias equal to σ² / n.
+  """
 
   def compute_chunk(
       self,
@@ -1161,6 +1223,32 @@ class EnsembleMeanMSE(EnsembleMetric):
 
     return _spatial_average(
         (truth - forecast.mean(self.ensemble_dim, skipna=False)) ** 2,
+        region=region,
+    )
+
+
+@dataclasses.dataclass
+class DebiasedEnsembleMeanMSE(EnsembleMetric):
+  """Debiased mean square error between the ensemble mean and ground truth.
+
+  Suppose we have a size n ensemble, {Xₖ}, each an iid copy of X having with
+  mean μ and variance σ². Let Y be the ground truth.
+  This class estimates E(X - Y)² with no bias. This is done by subtracting the
+  sample variance divided by n. As such, you must have n > 1 or the result will
+  be NaN.
+  """
+
+  def compute_chunk(
+      self,
+      forecast: xr.Dataset,
+      truth: xr.Dataset,
+      region: t.Optional[Region] = None,
+  ) -> xr.Dataset:
+    """DebiasedEnsembleMeanMSE, averaged over space, for one time chunk."""
+    _get_n_ensemble(forecast, self.ensemble_dim)  # Will raise if no ensembles.
+
+    return _spatial_average(
+        _debiased_ensemble_mean_mse(forecast, truth, self.ensemble_dim),
         region=region,
     )
 
@@ -1179,6 +1267,22 @@ class SpatialEnsembleMeanMSE(EnsembleMetric):
     _get_n_ensemble(forecast, self.ensemble_dim)  # Will raise if no ensembles.
 
     return (truth - forecast.mean(self.ensemble_dim, skipna=False)) ** 2
+
+
+@dataclasses.dataclass
+class DebiasedSpatialEnsembleMeanMSE(EnsembleMetric):
+  """DebiasedEnsembleMeanMSE (MSE, not RMSE), without spatial averaging."""
+
+  def compute_chunk(
+      self,
+      forecast: xr.Dataset,
+      truth: xr.Dataset,
+      region: t.Optional[Region] = None,
+  ) -> xr.Dataset:
+    """Squared error in the ensemble mean, for a time chunk of data."""
+    _get_n_ensemble(forecast, self.ensemble_dim)  # Will raise if no ensembles.
+
+    return _debiased_ensemble_mean_mse(forecast, truth, self.ensemble_dim)
 
 
 @dataclasses.dataclass
@@ -1289,29 +1393,15 @@ class EnergyScoreSkill(EnsembleMetric):
 
 
 @dataclasses.dataclass
-class EnsembleBrierScore(EnsembleMetric):
-  """Brier score of an ensemble forecast for a given binary threshold.
-
-  The Brier score is computed based on the forecast probability of exceedance of
-  a given climatological quantile. The true probability is binarized to 0 or 1.
-  The forecast probability is equal to the proportion of members that exceed
-  the quantile.
-
-  The Brier score for the binarized event of exceedance of a given threshold is
-  equal to the Brier score for the opposite event, i.e., the forecast remaining
-  below the threshold.
-
-  References:
-  [Ferro, 2007], Comparing Probabilistic Forecasting Systems with the Brier
-  Score, DOI: https://doi.org/10.1175/WAF1034.1
-  """
+class _BaseEnsembleBrierScore(EnsembleMetric):
+  """Base class for [Debiased]EnsembleBrierScore."""
 
   def __init__(
       self,
-      threshold: thresholds.Threshold | Sequence[thresholds.Threshold],
+      threshold: t.Union[thresholds.Threshold, Sequence[thresholds.Threshold]],
       ensemble_dim: str = REALIZATION,
   ):
-    """Initializes an EnsembleBrierScore.
+    """Initializes a _BaseEnsembleBrierScore.
 
     Args:
       threshold: Threshold used to binarize predictions and targets.
@@ -1320,12 +1410,14 @@ class EnsembleBrierScore(EnsembleMetric):
     super().__init__(ensemble_dim=ensemble_dim)
     self.threshold = threshold
 
-  def compute_chunk(
+  def _compute_chunk_impl(
       self,
+      debias: bool,
       forecast: xr.Dataset,
       truth: xr.Dataset,
       region: t.Optional[Region] = None,
   ) -> xr.Dataset:
+    """Common implementation of compute_chunk."""
 
     if isinstance(self.threshold, thresholds.Threshold):
       threshold_seq = [self.threshold]
@@ -1338,20 +1430,148 @@ class EnsembleBrierScore(EnsembleMetric):
     for threshold in threshold_seq:
       quantile = threshold.quantile
       threshold = threshold.compute(truth)
-      truth_probability = xr.where(truth > threshold, 1.0, 0.0)
-      forecast_probability = xr.where(forecast > threshold, 1.0, 0.0)
-      ensemble_forecast_probability = forecast_probability.mean(
-          self.ensemble_dim, skipna=False
+      truth_probability = xr.where(
+          truth.isnull(),
+          np.nan,
+          xr.where(truth > threshold, 1.0, 0.0),
       )
+      forecast_probability = xr.where(
+          forecast.isnull(), np.nan, xr.where(forecast > threshold, 1.0, 0.0)
+      )
+      if debias:
+        mse_of_probabilities = _debiased_ensemble_mean_mse(
+            forecast_probability,
+            truth_probability,
+            self.ensemble_dim,
+        )
+      else:
+        mse_of_probabilities = (
+            forecast_probability.mean(self.ensemble_dim, skipna=False)
+            - truth_probability
+        ) ** 2
+
       brier_scores.append(
           _spatial_average(
-              (ensemble_forecast_probability - truth_probability) ** 2,
+              mse_of_probabilities,
               region=region,
           ).expand_dims(dim={"quantile": [quantile]})
       )
 
     return xr.merge(brier_scores).assign_attrs(
         threshold_method=threshold_method
+    )
+
+
+@dataclasses.dataclass
+class EnsembleBrierScore(_BaseEnsembleBrierScore):
+  """Brier score of an ensemble forecast for a given binary threshold.
+
+  The Brier score is computed based on the forecast probability of exceedance of
+  a given climatological quantile. The true probability is binarized to 0 or 1.
+  The forecast probability is equal to the proportion of members that exceed
+  the quantile.
+
+  The Brier score for the binarized event of exceedance of a given threshold is
+  equal to the Brier score for the opposite event, i.e., the forecast remaining
+  below the threshold.
+
+  Given threshold σ, consider the Brier score of forecasts at fixed time and
+  space. Let Xₖ be the kth ensemble member (out of n total). Let 1{Y > σ} and
+  1{Xₖ > σ} be the indicators equal to 1 just when Y > σ and Xₖ > σ. Then,
+    EnsembleBrierScore = Bn = ( 1{Y > σ} - (1/n)Σₖ 1{Xₖ > σ} )²
+
+  As the ensemble size n → ∞
+    (1/n)Σₖ 1{Xₖ > σ} → Prob[X > σ]
+    Bn → B := ( 1{Y > σ} - Prob[X > σ] )²
+
+  For finite ensemble size, the bias is
+    E[Bn - B] = Prob[X > σ] (1 - Prob[X > σ]) / n,
+  which is just the sample variance divided by n.
+
+  References:
+  [Ferro, 2007], Comparing Probabilistic Forecasting Systems with the Brier
+  Score, DOI: https://doi.org/10.1175/WAF1034.1
+  """
+
+  def __init__(
+      self,
+      threshold: t.Union[thresholds.Threshold, Sequence[thresholds.Threshold]],
+      ensemble_dim: str = REALIZATION,
+  ):
+    """Initializes an EnsembleBrierScore.
+
+    Args:
+      threshold: Threshold used to binarize predictions and targets.
+      ensemble_dim: Dimension indexing ensemble member.
+    """
+    super().__init__(threshold=threshold, ensemble_dim=ensemble_dim)
+
+  def compute_chunk(
+      self,
+      forecast: xr.Dataset,
+      truth: xr.Dataset,
+      region: t.Optional[Region] = None,
+  ) -> xr.Dataset:
+    return self._compute_chunk_impl(
+        debias=False, forecast=forecast, truth=truth, region=region
+    )
+
+
+@dataclasses.dataclass
+class DebiasedEnsembleBrierScore(_BaseEnsembleBrierScore):
+  """Debiased Brier score of an ensemble forecast for a given binary threshold.
+
+  The Brier score is computed based on the forecast probability of exceedance of
+  a given climatological quantile. The true probability is binarized to 0 or 1.
+  The forecast probability is equal to the proportion of members that exceed
+  the quantile.
+
+  The Brier score for the binarized event of exceedance of a given threshold is
+  equal to the Brier score for the opposite event, i.e., the forecast remaining
+  below the threshold.
+
+  Given threshold σ, consider the Brier score of forecasts at fixed time and
+  space. Let Xₖ be the kth ensemble member (out of n total). Let 1{Y > σ} and
+  1{Xₖ > σ} be the indicators equal to 1 just when Y > σ and Xₖ > σ. Then,
+    EnsembleBrierScore = Bn = ( 1{Y > σ} - (1/n)Σₖ 1{Xₖ > σ} )²
+
+  As the ensemble size n → ∞
+    (1/n)Σₖ 1{Xₖ > σ} → Prob[X > σ]
+    Bn → B := ( 1{Y > σ} - Prob[X > σ] )²
+
+  For finite ensemble size, the bias is
+    E[Bn - B] = Prob[X > σ] (1 - Prob[X > σ]) / n,
+  which is just the sample variance divided by n.
+
+  For finite ensemble size, we debias the result by subtracting the sample
+  variance divided by n. As such, you must have n > 1 or the result will be NaN.
+
+  References:
+  [Ferro, 2007], Comparing Probabilistic Forecasting Systems with the Brier
+  Score, DOI: https://doi.org/10.1175/WAF1034.1
+  """
+
+  def __init__(
+      self,
+      threshold: t.Union[thresholds.Threshold, Sequence[thresholds.Threshold]],
+      ensemble_dim: str = REALIZATION,
+  ):
+    """Initializes a DebiasedEnsembleBrierScore.
+
+    Args:
+      threshold: Threshold used to binarize predictions and targets.
+      ensemble_dim: Dimension indexing ensemble member.
+    """
+    super().__init__(threshold=threshold, ensemble_dim=ensemble_dim)
+
+  def compute_chunk(
+      self,
+      forecast: xr.Dataset,
+      truth: xr.Dataset,
+      region: t.Optional[Region] = None,
+  ) -> xr.Dataset:
+    return self._compute_chunk_impl(
+        debias=True, forecast=forecast, truth=truth, region=region
     )
 
 
@@ -1371,7 +1591,7 @@ class EnsembleIgnoranceScore(EnsembleMetric):
 
   def __init__(
       self,
-      threshold: thresholds.Threshold | Sequence[thresholds.Threshold],
+      threshold: t.Union[thresholds.Threshold, Sequence[thresholds.Threshold]],
       ensemble_dim: str = REALIZATION,
   ):
     """Initializes an EnsembleIgnoranceScore.

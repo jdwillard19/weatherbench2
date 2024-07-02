@@ -261,6 +261,11 @@ FANOUT = flags.DEFINE_integer(
     None,
     help='Beam CombineFn fanout. Might be required for large dataset.',
 )
+NUM_THREADS = flags.DEFINE_integer(
+    'num_threads',
+    None,
+    help='Number of chunks to read/write Zarr in parallel per worker.',
+)
 
 
 def _wind_vector_error(err_type: str):
@@ -490,8 +495,31 @@ def main(argv: list[str]) -> None:
               'ensemble_mean_mse': metrics.EnsembleMeanMSE(
                   ensemble_dim=ENSEMBLE_DIM.value
               ),
+              'debiased_ensemble_mean_mse': metrics.DebiasedEnsembleMeanMSE(
+                  ensemble_dim=ENSEMBLE_DIM.value
+              ),
               'ensemble_variance': metrics.EnsembleVariance(
                   ensemble_dim=ENSEMBLE_DIM.value
+              ),
+          },
+          regions=regions,
+          against_analysis=False,
+          derived_variables=derived_variables,
+          evaluate_probabilistic_climatology=EVALUATE_PROBABILISTIC_CLIMATOLOGY.value,
+          probabilistic_climatology_start_year=PROBABILISTIC_CLIMATOLOGY_START_YEAR.value,
+          probabilistic_climatology_end_year=PROBABILISTIC_CLIMATOLOGY_END_YEAR.value,
+          probabilistic_climatology_hour_interval=PROBABILISTIC_CLIMATOLOGY_HOUR_INTERVAL.value,
+      ),
+      'ensemble_binary': config.Eval(
+          metrics={
+              'brier_score': metrics.EnsembleBrierScore(
+                  ensemble_dim=ENSEMBLE_DIM.value, threshold=threshold_list
+              ),
+              'debiased_brier_score': metrics.DebiasedEnsembleBrierScore(
+                  ensemble_dim=ENSEMBLE_DIM.value, threshold=threshold_list
+              ),
+              'ignorance_score': metrics.EnsembleIgnoranceScore(
+                  ensemble_dim=ENSEMBLE_DIM.value, threshold=threshold_list
               ),
           },
           regions=regions,
@@ -538,6 +566,11 @@ def main(argv: list[str]) -> None:
               ),
               'ensemble_mean_mse': metrics.SpatialEnsembleMeanMSE(
                   ensemble_dim=ENSEMBLE_DIM.value
+              ),
+              'debiased_ensemble_mean_mse': (
+                  metrics.DebiasedSpatialEnsembleMeanMSE(
+                      ensemble_dim=ENSEMBLE_DIM.value
+                  )
               ),
               'ensemble_variance': metrics.SpatialEnsembleVariance(
                   ensemble_dim=ENSEMBLE_DIM.value
@@ -601,24 +634,14 @@ def main(argv: list[str]) -> None:
   }
 
   if USE_BEAM.value:
-        if RUNNER.value == 'DirectRunner':
-            direct_runner_options = [
-                '--direct_num_workers=32',
-                '--direct_running_mode=multi_processing',
-            ]
-
-            # Combine existing argv with the new DirectRunner options
-            if argv is None:
-                argv = []
-            argv.extend(direct_runner_options)
-        evaluation.evaluate_with_beam(
-            data_config,
-            eval_configs,
-            runner=RUNNER.value,
-            input_chunks=INPUT_CHUNKS.value,
-            fanout=FANOUT.value,
-            argv=argv
-        )
+    evaluation.evaluate_with_beam(
+        data_config,
+        eval_configs,
+        runner=RUNNER.value,
+        input_chunks=INPUT_CHUNKS.value,
+        fanout=FANOUT.value,
+        argv=argv,
+    )
   else:
     evaluation.evaluate_in_memory(data_config, eval_configs)
 

@@ -15,6 +15,7 @@
 from absl.testing import absltest
 from absl.testing import parameterized
 import numpy as np
+from scipy import stats
 from weatherbench2 import metrics
 from weatherbench2 import regions
 from weatherbench2 import schema
@@ -59,14 +60,16 @@ class MetricsTest(parameterized.TestCase):
     # integral of cos(x) from 0*pi/6 to 1*pi/6 -> 0.5
     # integral of cos(x) from 1*pi/6 to 2*pi/6 -> (sqrt(3) - 1) / 2
     # integral of cos(x) from 2*pi/6 to 3*pi/6 -> 1 - sqrt(3) / 2
-    expected_data = 3 * np.array([
-        1 - np.sqrt(3) / 2,
-        (np.sqrt(3) - 1) / 2,
-        1 / 2,
-        1 / 2,
-        (np.sqrt(3) - 1) / 2,
-        1 - np.sqrt(3) / 2,
-    ])
+    expected_data = 3 * np.array(
+        [
+            1 - np.sqrt(3) / 2,
+            (np.sqrt(3) - 1) / 2,
+            1 / 2,
+            1 / 2,
+            (np.sqrt(3) - 1) / 2,
+            1 - np.sqrt(3) / 2,
+        ]
+    )
     expected = xr.DataArray(expected_data, coords=ds.coords, dims=['latitude'])
     xr.testing.assert_allclose(expected, weights)
 
@@ -90,22 +93,26 @@ class MetricsTest(parameterized.TestCase):
         time_stop='2022-01-02',
     )
 
-    forecast_modifier = xr.Dataset({
-        'u_component_of_wind': xr.DataArray(
-            [0, 3, np.NaN], coords={'level': forecast.level}
-        ),
-        'v_component_of_wind': xr.DataArray(
-            [0, -4, 1], coords={'level': forecast.level}
-        ),
-    })
-    truth_modifier = xr.Dataset({
-        'u_component_of_wind': xr.DataArray(
-            [0, -3, np.NaN], coords={'level': forecast.level}
-        ),
-        'v_component_of_wind': xr.DataArray(
-            [0, 4, 1], coords={'level': forecast.level}
-        ),
-    })
+    forecast_modifier = xr.Dataset(
+        {
+            'u_component_of_wind': xr.DataArray(
+                [0, 3, np.NaN], coords={'level': forecast.level}
+            ),
+            'v_component_of_wind': xr.DataArray(
+                [0, -4, 1], coords={'level': forecast.level}
+            ),
+        }
+    )
+    truth_modifier = xr.Dataset(
+        {
+            'u_component_of_wind': xr.DataArray(
+                [0, -3, np.NaN], coords={'level': forecast.level}
+            ),
+            'v_component_of_wind': xr.DataArray(
+                [0, 4, 1], coords={'level': forecast.level}
+            ),
+        }
+    )
 
     forecast = forecast + forecast_modifier
     truth = truth + truth_modifier
@@ -153,6 +160,23 @@ class MetricsTest(parameterized.TestCase):
     acc1 = metrics.ACC(climatology).compute_chunk(forecast, truth)
     acc2 = metrics.ACC(climatology_mean).compute_chunk(forecast, truth)
     xr.testing.assert_allclose(acc1, acc2)
+
+
+class RankDataTest(parameterized.TestCase):
+
+  @parameterized.parameters(
+      ((4, 5, 6), 0),
+      ((4, 8, 6), 1),
+      ((4, 2, 6), 2),
+      ((4, 5, 7), -1),
+      ((1, 5), 0),
+      ((1, 5), 1),
+  )
+  def test_vs_scipy(self, shape, axis):
+    x = np.random.RandomState(1729 + axis + np.prod(shape)).rand(*shape)
+    ranks = metrics._rankdata(x, axis)
+    sp_ranks = stats.rankdata(x, method='ordinal', axis=axis)
+    np.testing.assert_array_equal(ranks, sp_ranks)
 
 
 class CRPSTest(parameterized.TestCase):
@@ -751,6 +775,48 @@ class EnsembleMeanRMSEAndStddevTest(parameterized.TestCase):
     xr.testing.assert_allclose(xr.zeros_like(mean_rmse), mean_rmse)
 
 
+class DebiasedEnsembleMeanMSETest(parameterized.TestCase):
+
+  def test_versus_large_ensemble(self):
+    large_ensemble_size = 1000
+    truth, forecast = get_random_truth_and_forecast(
+        ensemble_size=large_ensemble_size,
+        spatial_resolution_in_degrees=20,
+    )
+    small_ensemble_forecast = forecast.isel({metrics.REALIZATION: slice(2)})
+
+    mse_large_ensemble = metrics.EnsembleMeanMSE().compute_chunk(
+        forecast, truth
+    )
+    mse_small_ensemble = metrics.EnsembleMeanMSE().compute_chunk(
+        small_ensemble_forecast, truth
+    )
+    mse_debiased_small_ensemble = (
+        metrics.DebiasedEnsembleMeanMSE().compute_chunk(
+            small_ensemble_forecast, truth
+        )
+    )
+
+    var_large_ensemble = metrics.EnsembleVariance().compute_chunk(
+        forecast, truth
+    )
+
+    # Demonstrate the test is not trivial by showing that the small ensemble has
+    # the anticipated bias.
+    anticipated_bias = var_large_ensemble.max() / 2
+    observed_bias = (mse_small_ensemble - mse_large_ensemble).mean()
+    xr.testing.assert_allclose(observed_bias, anticipated_bias, rtol=0.05)
+
+    total_points = np.prod(list(truth.dims.values()))
+    stderr = np.sqrt(var_large_ensemble.geopotential.max() / total_points)
+
+    xr.testing.assert_allclose(
+        mse_large_ensemble.mean(),
+        mse_debiased_small_ensemble.mean(),
+        atol=4 * stderr,
+    )
+
+
 def _crps_brute_force(forecast: xr.Dataset, truth: xr.Dataset) -> xr.Dataset:
   """The eFAIR version of CRPS from Zamo & Naveau over a chunk of data."""
 
@@ -843,10 +909,11 @@ class EnergyScoreTest(parameterized.TestCase):
 class EnsembleBrierScoreTest(parameterized.TestCase):
 
   @parameterized.named_parameters(
-      dict(testcase_name='perfect model', error=0.0, expected=0.0),
-      dict(testcase_name='useless model', error=-10.0, expected=1.0),
+      dict(testcase_name='perfect', error=0.0, ens_delta=0.1, expected=0.0),
+      dict(testcase_name='ok', error=0.0, ens_delta=1.0, expected=0.25),
+      dict(testcase_name='useless', error=-10.0, ens_delta=0.1, expected=1.0),
   )
-  def test_ensemble_brier_score(self, error, expected):
+  def test_ensemble_brier_score(self, error, ens_delta, expected):
     kwargs = {
         'variables_2d': ['2m_temperature'],
         'variables_3d': [],
@@ -858,7 +925,13 @@ class EnsembleBrierScoreTest(parameterized.TestCase):
     )
     truth = schema.mock_truth_data(**kwargs)
     truth = truth + 1.0
-    forecast = forecast + 1.0 + error
+    forecast = (
+        forecast
+        + 1.0
+        + error
+        + ens_delta * np.arange(-2, 2).reshape((4, 1, 1, 1, 1))
+    )
+
     climatology_mean = truth.isel(time=0, drop=True).expand_dims(dayofyear=366)
     climatology_std = (
         truth.isel(time=0, drop=True)
@@ -875,6 +948,133 @@ class EnsembleBrierScoreTest(parameterized.TestCase):
     expected_arr = np.array([[expected, expected]])
     np.testing.assert_allclose(
         result['2m_temperature'].values, expected_arr, rtol=1e-4
+    )
+
+  def test_nan_propagates_to_output(self):
+    kwargs = {
+        'variables_2d': ['2m_temperature'],
+        'variables_3d': [],
+        'time_start': '2022-01-01',
+        'time_stop': '2022-01-03',
+    }
+    forecast = schema.mock_forecast_data(
+        ensemble_size=4, lead_stop='1 day', **kwargs
+    )
+    forecast = (
+        # Use settings from test_ensemble_brier_score that result in score=0.
+        forecast
+        + 1.0
+        + 0.1 * np.arange(-2, 2).reshape((4, 1, 1, 1, 1))
+    )
+    truth = schema.mock_truth_data(**kwargs)
+    truth = truth + 1.0
+
+    forecast_with_nan = xr.where(
+        forecast.prediction_timedelta < forecast.prediction_timedelta[-1],
+        np.nan,
+        forecast,
+    )
+    truth_with_nan = xr.where(truth.time < truth.time[-1], np.nan, truth)
+
+    climatology_mean = truth.isel(time=0, drop=True).expand_dims(dayofyear=366)
+    climatology_std = (
+        truth.isel(time=0, drop=True)
+        .expand_dims(
+            dayofyear=366,
+        )
+        .rename({'2m_temperature': '2m_temperature_std'})
+    )
+    climatology = xr.merge([climatology_mean, climatology_std])
+    threshold = thresholds.GaussianQuantileThreshold(
+        climatology=climatology, quantile=0.2
+    )
+
+    with self.subTest('forecast has nan'):
+      # When forecast has nan in prediction_timedelta, only that timedelta will
+      # be NaN.
+      result = metrics.EnsembleBrierScore(threshold).compute(
+          forecast_with_nan, truth
+      )
+      expected_arr = np.array([[np.nan, 0.0]])
+      np.testing.assert_allclose(
+          result['2m_temperature'].values,
+          expected_arr,
+      )
+
+    with self.subTest('truth has nan'):
+      # When truth has nan, the final average over times means the entire
+      # score is NaN.
+      result = metrics.EnsembleBrierScore(threshold).compute(
+          forecast, truth_with_nan
+      )
+      expected_arr = np.array([[np.nan, np.nan]])
+      np.testing.assert_allclose(
+          result['2m_temperature'].values,
+          expected_arr,
+      )
+
+
+class DebiasedEnsembleBrierScoreTest(parameterized.TestCase):
+
+  def test_versus_large_ensemble(self):
+    large_ensemble_size = 1000
+    threshold = 1.0
+
+    # truth, forecast are both Normal(0, 1)
+    truth, forecast = get_random_truth_and_forecast(
+        ensemble_size=large_ensemble_size,
+        spatial_resolution_in_degrees=20,
+    )
+    small_ensemble_forecast = forecast.isel({metrics.REALIZATION: slice(2)})
+
+    # climatology has the same stats as Normal(0, 1). So truth/forecast should
+    # be "perfect".
+    climatology_mean = xr.zeros_like(
+        truth.isel(time=0, drop=True).expand_dims(dayofyear=366)
+    )
+    climatology_std = xr.ones_like(
+        truth.isel(time=0, drop=True)
+        .expand_dims(
+            dayofyear=366,
+        )
+        .rename({'geopotential': 'geopotential_std'})
+    )
+    climatology = xr.merge([climatology_mean, climatology_std])
+    quantile = 0.2
+    threshold = thresholds.GaussianQuantileThreshold(
+        climatology=climatology,
+        quantile=quantile,
+    )
+
+    bs_large_ensemble = metrics.EnsembleBrierScore(threshold).compute(
+        forecast, truth
+    )
+    bs_small_ensemble = metrics.EnsembleBrierScore(threshold).compute(
+        small_ensemble_forecast, truth
+    )
+    bs_debiased_small_ensemble = metrics.DebiasedEnsembleBrierScore(
+        threshold
+    ).compute(small_ensemble_forecast, truth)
+
+    # Make sure the test is not trivial by showing that without debiasing we get
+    # the expected bias. Since truth/forecast are drawn from the correct
+    # distribution, we know the variance, and then
+    #   bias = variance / ensemble_size
+    #        = p * (1 - p) / 2
+    variance = (1 - quantile) * quantile
+    anticipated_bias = variance / 2
+    observed_bias = (bs_small_ensemble - bs_large_ensemble).mean()
+    np.testing.assert_allclose(
+        observed_bias.geopotential.data, anticipated_bias, rtol=0.05
+    )
+
+    total_points = np.prod(list(truth.dims.values()))
+    stderr = np.sqrt(variance / total_points)
+
+    xr.testing.assert_allclose(
+        bs_large_ensemble.mean(),
+        bs_debiased_small_ensemble.mean(),
+        atol=4 * stderr,
     )
 
 

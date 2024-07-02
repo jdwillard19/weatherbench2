@@ -120,6 +120,11 @@ SEEPS_DRY_THRESHOLD_MM = flags.DEFINE_string(
         'precipitation variable. In mm.'
     ),
 )
+NUM_THREADS = flags.DEFINE_integer(
+    'num_threads',
+    None,
+    help='Number of chunks to read/write in parallel per worker.',
+)
 
 
 class Quantile:
@@ -161,10 +166,12 @@ class SEEPSThreshold:
     if weights is not None:
       heavy_threshold = heavy_threshold.weighted(weights)  # pytype: disable=wrong-arg-types
     heavy_threshold = heavy_threshold.quantile(2 / 3, dim=dim)
-    out = xr.Dataset({
-        f'{self.var}_seeps_threshold': heavy_threshold.drop('quantile'),
-        f'{self.var}_seeps_dry_fraction': dry_fraction,
-    })
+    out = xr.Dataset(
+        {
+            f'{self.var}_seeps_threshold': heavy_threshold.drop('quantile'),
+            f'{self.var}_seeps_dry_fraction': dry_fraction,
+        }
+    )
     return out
 
 
@@ -311,10 +318,12 @@ def main(argv: list[str]) -> None:
   seeps_dry_threshold_mm = ast.literal_eval(SEEPS_DRY_THRESHOLD_MM.value)
   if 'seeps' in STATISTICS.value:
     for v in seeps_dry_threshold_mm.keys():
-      clim_template = clim_template.assign({
-          f'{v}_seeps_threshold': clim_template[v],
-          f'{v}_seeps_dry_fraction': clim_template[v],
-      })
+      clim_template = clim_template.assign(
+          {
+              f'{v}_seeps_threshold': clim_template[v],
+              f'{v}_seeps_dry_fraction': clim_template[v],
+          }
+      )
 
   def _compute_seeps(kv):
     k, _ = kv
@@ -326,6 +335,10 @@ def main(argv: list[str]) -> None:
     if stat not in ['seeps', 'mean']:
       for var in raw_vars:
         if stat == 'quantile':
+          if not quantiles:
+            raise ValueError(
+                'Cannot compute stat `quantile` without specifying --quantiles.'
+            )
           quantile_dim = xr.DataArray(
               quantiles, name='quantile', dims=['quantile']
           )
@@ -345,7 +358,10 @@ def main(argv: list[str]) -> None:
     pcoll = (
         root
         | xbeam.DatasetToChunks(
-            obs, input_chunks, split_vars=True, num_threads=16
+            obs,
+            input_chunks,
+            split_vars=True,
+            num_threads=NUM_THREADS.value,
         )
         | 'RechunkIn'
         >> xbeam.Rechunk(  # pytype: disable=wrong-arg-types
@@ -408,7 +424,7 @@ def main(argv: list[str]) -> None:
             OUTPUT_PATH.value,
             template=clim_template,
             zarr_chunks=output_chunks,
-            num_threads=16,
+            num_threads=NUM_THREADS.value,
         )
     )
 
