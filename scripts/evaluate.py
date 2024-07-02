@@ -81,6 +81,18 @@ CLIMATOLOGY_PATH = flags.DEFINE_string(
     None,
     help='Path to climatology. Used to compute e.g. ACC.',
 )
+DIRECT_NUM_WORKERS = flags.DEFINE_integer(
+    'direct_num_workers',
+    default=1,
+    help='Number of workers for DirectRunner. Determines the level of parallelism.',
+)
+
+DIRECT_RUNNING_MODE = flags.DEFINE_string(
+    'direct_running_mode',
+    default='multi_threading',
+    help='Running mode for DirectRunner. Can be "multi_threading" or "multi_processing".',
+)
+
 BY_INIT = flags.DEFINE_bool(
     'by_init',
     True,
@@ -589,14 +601,24 @@ def main(argv: list[str]) -> None:
   }
 
   if USE_BEAM.value:
-    evaluation.evaluate_with_beam(
-        data_config,
-        eval_configs,
-        runner=RUNNER.value,
-        input_chunks=INPUT_CHUNKS.value,
-        fanout=FANOUT.value,
-        argv=argv,
-    )
+        if RUNNER.value == 'DirectRunner':
+            direct_runner_options = [
+                '--direct_num_workers=32',
+                '--direct_running_mode=multi_processing',
+            ]
+
+            # Combine existing argv with the new DirectRunner options
+            if argv is None:
+                argv = []
+            argv.extend(direct_runner_options)
+        evaluation.evaluate_with_beam(
+            data_config,
+            eval_configs,
+            runner=RUNNER.value,
+            input_chunks=INPUT_CHUNKS.value,
+            fanout=FANOUT.value,
+            argv=argv
+        )
   else:
     evaluation.evaluate_in_memory(data_config, eval_configs)
 

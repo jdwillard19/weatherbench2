@@ -29,6 +29,7 @@ from typing import Any, Optional
 import apache_beam as beam
 import fsspec
 import numpy as np
+import pdb
 from weatherbench2 import config
 from weatherbench2 import schema
 from weatherbench2 import utils
@@ -83,6 +84,13 @@ def _decode_pressure_level_suffixes(forecast: xr.Dataset) -> xr.Dataset:
       da = da.rename('_'.join(var.split('_')[:-1])).expand_dims({'level': 1})  # pytype: disable=attribute-error
     das.append(da)
 
+  # maybe needed?
+  # for da in das:
+  #     print("chunking", da)
+  #     chunk_dict = {dim: 1 for dim in da.dims if dim in ['time', 'prediction_timedelta']}
+  #     if chunk_dict:  # Only chunk if there are relevant dimensions
+  #         da = da.chunk(chunk_dict)
+  
   ds = xr.merge(das)
   logging.info(f'Merged forecast: {ds}')
   return ds
@@ -95,6 +103,7 @@ def open_source_files(
     use_dask: bool = False,
     rename_variables: Optional[dict[str, str]] = None,
     pressure_level_suffixes: bool = False,
+    chunks: abc.Mapping[str, int] = None
 ) -> tuple[xr.Dataset, xr.Dataset]:
   """Open forecast and ground obs Zarr files and standardize them.
 
@@ -117,6 +126,7 @@ def open_source_files(
       forecast_path,
       # Use dask to decode pressure levels since xr's expand_dims is not lazy
       chunks='auto' if (use_dask or pressure_level_suffixes) else None,
+      consolidated=True
   )
 
   if pressure_level_suffixes:
@@ -294,6 +304,7 @@ def open_forecast_and_truth_datasets(
     data_config: config.Data,
     eval_config: config.Eval,
     use_dask: bool = False,
+    chunks: abc.Mapping[str, int] = None
 ) -> tuple[xr.Dataset, xr.Dataset, xr.Dataset | None]:
   """Open datasets and select desired slices.
 
@@ -316,6 +327,7 @@ def open_forecast_and_truth_datasets(
       use_dask=use_dask,
       rename_variables=data_config.rename_variables,
       pressure_level_suffixes=data_config.pressure_level_suffixes,
+      chunks=chunks
   )
 
   obs_all_times = _impose_data_selection(
@@ -708,7 +720,7 @@ class _EvaluateAllMetrics(beam.PTransform):
 
   def expand(self, pcoll: beam.PCollection) -> beam.PCollection:
     forecast, truth, climatology = open_forecast_and_truth_datasets(
-        self.data_config, self.eval_config
+        self.data_config, self.eval_config, use_dask=True, chunks=self.input_chunks
     )
     logging.info(
         f'forecast={forecast}, truth={truth}, climatology={climatology}'
@@ -752,16 +764,10 @@ def evaluate_with_beam(
     fanout: Beam CombineFn fanout.
     argv: Other arguments to pass into the Beam pipeline.
   """
-
   with beam.Pipeline(runner=runner, argv=argv) as root:
     for eval_name, eval_config in eval_configs.items():
       logging.info(f'Logging Eval config: {eval_config}')
-      _ = (
-          root
-          | f'evaluate_{eval_name}'
-          >> _EvaluateAllMetrics(
-              eval_name, eval_config, data_config, input_chunks, fanout=fanout
-          )
+      _ = (root | f'evaluate_{eval_name}'  >> _EvaluateAllMetrics(eval_name, eval_config, data_config, input_chunks, fanout=fanout)
           | f'save_{eval_name}'
           >> _SaveOutputs(eval_name, data_config, eval_config.output_format)
       )
