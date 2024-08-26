@@ -78,7 +78,7 @@ OBS_PATH = flags.DEFINE_string(
 )
 CLIMATOLOGY_PATH = flags.DEFINE_string(
     'climatology_path',
-    None,
+    default=None,
     help='Path to climatology. Used to compute e.g. ACC.',
 )
 DIRECT_NUM_WORKERS = flags.DEFINE_integer(
@@ -397,8 +397,9 @@ def main(argv: list[str]) -> None:
     }
 
   # Open climatology for ACC and quantile metrics computation
-  climatology = xr.open_zarr(CLIMATOLOGY_PATH.value)
-  climatology = evaluation.make_latitude_increasing(climatology)
+  if CLIMATOLOGY_PATH.value is not None:
+    climatology = xr.open_zarr(CLIMATOLOGY_PATH.value)
+    climatology = evaluation.make_latitude_increasing(climatology)
 
   if QUANTILE_THRESHOLDS.value:
     threshold_cls = thresholds.get_threshold_cls(THRESHOLD_METHOD.value)
@@ -409,12 +410,20 @@ def main(argv: list[str]) -> None:
   else:
     threshold_list = []
 
-  deterministic_metrics = {
-      'mse': metrics.MSE(wind_vector_mse=_wind_vector_error('mse')),
-      'acc': metrics.ACC(climatology=climatology),
-      'bias': metrics.Bias(),
-      'mae': metrics.MAE(),
-  }
+  if CLIMATOLOGY_PATH.value is not None:
+      
+    deterministic_metrics = {
+        'mse': metrics.MSE(wind_vector_mse=_wind_vector_error('mse')),
+        'acc': metrics.ACC(climatology=climatology),
+        'bias': metrics.Bias(),
+        'mae': metrics.MAE(),
+    }
+  else: 
+    deterministic_metrics = {
+        'mse': metrics.MSE(wind_vector_mse=_wind_vector_error('mse')),
+        'bias': metrics.Bias(),
+        'mae': metrics.MAE(),
+    }
   rmse_metrics = {
       'rmse_sqrt_before_time_avg': metrics.RMSESqrtBeforeTimeAvg(
           wind_vector_rmse=_wind_vector_error('rmse')
@@ -425,7 +434,7 @@ def main(argv: list[str]) -> None:
       'mse': metrics.SpatialMSE(),
       'mae': metrics.SpatialMAE(),
   }
-  if COMPUTE_SEEPS.value:
+  if COMPUTE_SEEPS.value and CLIMATOLOGY_PATH is not None:
     deterministic_metrics['seeps_24hr'] = metrics.SEEPS(
         climatology=climatology,
         precip_name='total_precipitation_24hr',

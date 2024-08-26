@@ -25,7 +25,7 @@ import dataclasses
 import logging
 import os.path
 from typing import Any, Optional, Union
-
+import os
 import apache_beam as beam
 import fsspec
 import numpy as np
@@ -449,7 +449,6 @@ def _evaluate_all_metrics(
   forecast, truth, climatology = open_forecast_and_truth_datasets(
       data_config, eval_config, use_dask=True
   )
-
   if eval_config.evaluate_climatology:
     time_dim = 'valid_time' if data_config.by_init else 'time'
     forecast = climatology[list(forecast.keys())].sel(
@@ -475,8 +474,7 @@ def _evaluate_all_metrics(
   if data_config.by_init:
     truth = truth.sel(time=forecast.valid_time)
 
-  results = _metric_and_region_loop(forecast, truth, eval_config)
-
+  results = _metric_and_region_loop(forecast, truth, eval_config, compute_chunk=True)
   logging.info(f'Logging Evaluation complete:\n{results}')
 
   output_path = _get_output_path(data_config, eval_name, 'netcdf')
